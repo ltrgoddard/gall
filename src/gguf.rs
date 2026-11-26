@@ -5,11 +5,12 @@
 //   g.t["blk.0.attn_q.weight"] -> Tensor { dims, ty, off, len }
 use std::collections::HashMap;
 
+#[derive(Clone, Copy)]
 pub enum Val {
     U(u64),
     I(i64),
     F(f64),
-    S,
+    S(&'static [u8]),
     A(u32, usize, &'static [u8]), // item type, count, raw items
 }
 
@@ -82,10 +83,7 @@ impl Cur {
             11 => Val::I(self.u(8) as i64),
             6 => Val::F(f32::from_bits(self.u(4) as u32) as f64),
             12 => Val::F(f64::from_bits(self.u(8))),
-            8 => {
-                self.s();
-                Val::S
-            }
+            8 => Val::S(self.s()),
             9 => {
                 let (ty, n) = (self.u(4) as u32, self.u(8) as usize);
                 let a = self.1;
@@ -129,6 +127,20 @@ pub fn open(path: &str) -> Gguf {
         let ty = c.u(4) as u32;
         kv.insert(k, c.val(ty));
     }
+    // mainline llama.cpp names the looped model inkling2_loop and prefixes its
+    // keys so (unsloth/Inkling-2-Mini-GGUF since 23 November 2026); the reads
+    // below use inkling2.*, so each key is also kept under that name
+    if let Some(Val::S(b"inkling2_loop")) = kv.get("general.architecture") {
+        let al: Vec<&'static str> = kv.keys()
+            .filter_map(|k| k.strip_prefix("inkling2_loop."))
+            .filter(|k| !kv.contains_key(format!("inkling2.{k}").as_str()))
+            .map(|k| &*Box::leak(format!("inkling2.{k}").into_boxed_str()))
+            .collect();
+        for a in al {
+            let v = kv[format!("inkling2_loop.{}", &a[9..]).as_str()];
+            kv.insert(a, v);
+        }
+    }
     let mut t: Vec<Tensor> = (0..nt)
         .map(|_| {
             let name = st(c.s());
@@ -151,7 +163,8 @@ pub fn open(path: &str) -> Gguf {
 
 impl Gguf {
     pub fn f(&self, k: &str) -> f64 {
-        match self.kv[k] {
+        let Some(v) = self.kv.get(k) else { panic!("gguf: no key {k}") };
+        match *v {
             Val::U(v) => v as f64,
             Val::I(v) => v as f64,
             Val::F(v) => v,

@@ -36,6 +36,10 @@ pub trait Lm {
     fn len(&self) -> usize;
     // forget all but the first n tokens; false if that needs a reset
     fn truncate(&mut self, n: usize) -> bool;
+    // a length truncate() can always go back to (the checkpoint), if any
+    fn mark(&self) -> Option<usize> {
+        None
+    }
     // step() over toks (not empty); override to batch
     fn feed(&mut self, toks: &[u32]) -> &[f32] {
         let (l, h) = toks.split_last().unwrap();
@@ -45,10 +49,13 @@ pub trait Lm {
         self.step(*l)
     }
     // holds p[..k]: restore or feed and store prefixes of p up to the
-    // system region p[..sys]; the new k and the length restored
-    fn prime(&mut self, _p: &[u32], k: usize, _sys: usize) -> (usize, usize) {
-        (k, 0)
+    // system region p[..sys]; the new k, the length restored and the
+    // length of the snapshot it came from
+    fn prime(&mut self, _p: &[u32], k: usize, _sys: usize) -> (usize, usize, usize) {
+        (k, 0, 0)
     }
+    // forget the images not among these keys (those of the prompt)
+    fn keep(&mut self, _keys: &[u32]) {}
     // store toks, which it holds (or nothing, if empty), and free memory
     fn park(&mut self, _toks: &[u32]) {}
     fn loaded(&self) -> bool {
@@ -97,11 +104,19 @@ impl Lm for Lazy {
     fn truncate(&mut self, n: usize) -> bool {
         self.get().truncate(n)
     }
+    fn mark(&self) -> Option<usize> {
+        self.0.as_ref().and_then(|m| m.mark())
+    }
     fn feed(&mut self, toks: &[u32]) -> &[f32] {
         self.get().feed(toks)
     }
-    fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize) {
+    fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize, usize) {
         self.get().prime(p, k, sys)
+    }
+    fn keep(&mut self, keys: &[u32]) {
+        if let Some(m) = &mut self.0 {
+            m.keep(keys)
+        }
     }
     fn park(&mut self, toks: &[u32]) {
         if let Some(mut m) = self.0.take() {
@@ -1040,6 +1055,10 @@ impl Srv {
                     k => format!(", the oldest {k} left out (store full)"),
                 });
         }
+        let ids: Vec<Range<u32>> = ids.collect();
+        let keys: Vec<u32> = ids.iter().filter(|r| !r.is_empty())
+            .map(|r| (r.start - crate::model::IMG) >> 12).collect();
+        self.lm.keep(&keys);
         let (enc, mut p, mut at) = (|s: &str| self.tok.enc(s, true), vec![], 0);
         for ((to, _), ids) in urls.iter().zip(ids) {
             p.extend(enc(&o[at..*to]));
@@ -1098,6 +1117,7 @@ impl Srv {
         }
 
         let t0 = Instant::now();
+        let prev = self.fed.len(); // the state of the last chat, if in memory
         if self.lm.len() != self.fed.len() {
             self.lm.reset();
             self.fed.clear();
@@ -1105,11 +1125,34 @@ impl Srv {
         let same = self.fed.iter().zip(&p).take_while(|(a, b)| a == b).count();
         let mut k = same.min(p.len() - 1);
         if k < self.fed.len() && !self.lm.truncate(k) {
-            self.lm.reset();
-            k = 0;
+            // a client that drops the thinking parts from where the last
+            // prompt ended: back to the checkpoint just before that end
+            match self.lm.mark().filter(|&c| c <= k) {
+                Some(c) if self.lm.truncate(c) => k = c,
+                _ => {
+                    self.lm.reset();
+                    k = 0;
+                }
+            }
         }
-        let (at, snap) = self.lm.prime(&p, k, sys);
-        let k = k.max(snap); // not fed for this request
+        let (at, snap, of) = self.lm.prime(&p, k, sys);
+        // hit: all of the last state (in memory, or the snapshot read) is a
+        // prefix of p; partial: a shorter prefix is, the rest is fed (the
+        // client changed earlier messages, or dropped thinking); miss: none
+        let (mem, used) = (if snap > 0 { 0 } else { k }, k.max(snap));
+        let kind = match () {
+            _ if used == 0 => "miss",
+            _ if (snap > 0 && snap == of) || (snap == 0 && mem == prev) => "hit",
+            _ => "partial",
+        };
+        let src = match () {
+            _ if snap > 0 => format!("snapshot of {of}"),
+            _ if mem > 0 => "memory".to_string(),
+            _ => "nothing".to_string(),
+        };
+        eprintln!("gall: cache {kind}: {used} of {} prompt tokens reused from {src}, {} fed",
+            p.len(), p.len() - used);
+        let k = used; // not fed for this request
         self.fed.clear();
         self.fed.extend(&p);
         self.lm.draft();
@@ -1415,6 +1458,9 @@ impl Lm for Ink {
         self.draft();
         self.0.truncate(n)
     }
+    fn mark(&self) -> Option<usize> {
+        self.0.mark()
+    }
     // the checkpoint is before the last token: the same prompt again
     // (regenerate) goes back to it
     fn feed(&mut self, toks: &[u32]) -> &[f32] {
@@ -1428,12 +1474,17 @@ impl Lm for Ink {
         self.step(*l)
     }
     // what prime restores or feeds has no drafter context
-    fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize) {
+    fn prime(&mut self, p: &[u32], k: usize, sys: usize) -> (usize, usize, usize) {
         let r = self.2.prime(&mut self.0, p, k, sys);
         if let Some((d, ..)) = self.5.as_ref().filter(|_| r.0 > k) {
             d.forget(r.0);
         }
-        r
+        (r.0, r.1, self.2.of)
+    }
+    fn keep(&mut self, keys: &[u32]) {
+        let id = |k: u64| k as u32 & 0x7ffff;
+        self.4.retain(|&k, _| keys.contains(&id(k)));
+        self.0.pend.retain(|k, _| keys.contains(k));
     }
     // also drops the rows verified ahead: the model is about to move
     fn draft(&mut self) -> String {
@@ -1489,14 +1540,15 @@ impl Lm for Ink {
         };
         // two images with one 19-bit key: forget what was built on the first
         let (id, m) = (|k: u64| k as u32 & 0x7ffff, &mut self.0);
-        let twin = self.4.keys().any(|&k| id(k) == id(key));
-        if twin || !m.image(key as u32, &e) {
+        if self.4.keys().any(|&k| id(k) == id(key)) {
             (m.ni, self.4) = (0, HashMap::new());
-            m.ib.clear();
-            if twin {
-                m.reset();
-            }
+            (m.ib, m.pend) = (HashMap::new(), HashMap::new());
+            m.reset();
             return Err(FULL.into());
+        }
+        // the store needs room only for the images of one pass (Model::stage)
+        if !m.image(key as u32, &e) {
+            return Err("the image is larger than the image store".into());
         }
         self.4.insert(key, e.len() / 2304);
         Ok(Model::ids(key as u32, e.len() / 2304))
@@ -1551,6 +1603,7 @@ pub fn main(a: &[String]) {
             }
         });
         let (p, draft) = (a[0].clone(), !a.iter().any(|x| x == "--no-draft"));
+        let draft = draft && crate::dr::usable(&p);
         Box::new(move || {
             crate::up::lock(true);
             let mut m = crate::model::Model::open(&p, ctx);

@@ -121,6 +121,9 @@ pub struct Model {
     im: Buf, // image embeddings, f32 rows
     pub ni: usize,
     pub ib: HashMap<u32, usize>, // first row of an image by its key
+    // every image the prompt may feed, by key, until stage() copies the
+    // ones a pass reads into im: the store holds a pass's images, not a chat's
+    pub pend: HashMap<u32, Vec<f32>>,
     out: T,
     tn: u32,
     oq: u32,
@@ -224,10 +227,18 @@ impl Model {
                 } else {
                     ["q", "k", "v"].map(|c| w(&format!("attn_{c}_inp_norm.weight")))
                 };
-                let ctl = ["attn", "k", "v", "mlp"]
-                    .map(|c| {
-                        ["down", "gain", "forget"]
-                            .map(|k| wh(&format!("loop_{c}_{k}.weight")))[0]
+                // controllers, as unsloth named them (attn k v mlp) or as
+                // mainline llama.cpp does (q k v ffn, loop_{c}_ctrl_{k})
+                let ctl = [("attn", "q"), ("k", "k"), ("v", "v"), ("mlp", "ffn")]
+                    .map(|(c, m)| {
+                        ["down", "gain", "forget"].map(|k| {
+                            let n = format!("loop_{c}_{k}.weight");
+                            if g.t.contains_key(format!("blk.{i}.{n}").as_str()) {
+                                wh(&n)
+                            } else {
+                                wh(&format!("loop_{m}_ctrl_{k}.weight"))
+                            }
+                        })[0]
                     })[0];
                 L {
                     swa,
@@ -266,16 +277,30 @@ impl Model {
         let oq = sm("output_res_query.weight".into());
         let on = sm("output_norm.weight".into());
         // message queries of core layer i: res[2i], kv[2i], kv[2i+1], res[2i+1]
-        let (res, kvq) = (
-            sm("loop_res_query.weight".into()) as usize,
-            sm("loop_kv_res_query.weight".into()) as usize,
-        );
-        let mq = s.len() as u32;
-        for i in 0..12 {
-            for o in [res + 2 * i * N, kvq + 2 * i * N, kvq + (2 * i + 1) * N, res + (2 * i + 1) * N] {
-                s.extend_from_within(o..o + N);
+        // (unsloth layout), which are the q, k, v and ffn columns of mainline
+        // llama.cpp's blk.{6+i}.loop_msg_query, [N, 4]
+        let mq = if g.t.contains_key("loop_res_query.weight") {
+            let (res, kvq) = (
+                sm("loop_res_query.weight".into()) as usize,
+                sm("loop_kv_res_query.weight".into()) as usize,
+            );
+            let mq = s.len() as u32;
+            for i in 0..12 {
+                for o in [res + 2 * i * N, kvq + 2 * i * N, kvq + (2 * i + 1) * N, res + (2 * i + 1) * N] {
+                    s.extend_from_within(o..o + N);
+                }
             }
-        }
+            mq
+        } else {
+            let o: Vec<u32> = (6..18)
+                .map(|l| sm(format!("blk.{l}.loop_msg_query.weight")))
+                .collect();
+            for (i, &x) in o.iter().enumerate() {
+                assert!(x != 0 && x as usize == o[0] as usize + 4 * N * i,
+                        "blk.{}.loop_msg_query: missing or not [N, 4]", 6 + i);
+            }
+            o[0]
+        };
         let (sb, hb) = (gpu.buf(4 * s.len()), gpu.buf(2 * sh.len()));
         slice::<f32>(&sb)[..s.len()].copy_from_slice(&s);
         slice::<u16>(&hb)[..sh.len()].copy_from_slice(&sh);
@@ -303,6 +328,7 @@ impl Model {
             im: gpu.buf(4 * N * IMR),
             ni: 0,
             ib: HashMap::new(),
+            pend: HashMap::new(),
             out: &g.t["output.weight"],
             tn,
             oq,
@@ -366,16 +392,45 @@ impl Model {
         a..a + n as u32
     }
 
-    // keep the rows of image key; false when the store is full
+    // the rows of image key, for stage() to copy in when a pass reads them;
+    // false when one image is more than the store holds
     pub fn image(&mut self, key: u32, e: &[f32]) -> bool {
-        let (a, b) = (self.ni, self.ni + e.len() / N);
-        let Some(r) = slice::<f32>(&self.im).get_mut(a * N..b * N) else {
+        if e.len() / N > IMR {
             return false;
-        };
-        r.copy_from_slice(e);
-        self.ib.insert(key & 0x7ffff, a);
-        self.ni = b;
+        }
+        self.ib.remove(&(key & 0x7ffff)); // what the store held may be another's
+        self.pend.insert(key & 0x7ffff, e.to_vec());
         true
+    }
+
+    // the images toks read, in the store: one not there is copied in, and
+    // when they do not fit the store starts again with only these. rows
+    // already fed are in the cache, so an image is only needed while fed
+    pub fn stage(&mut self, toks: &[u32]) {
+        let mut keys: Vec<u32> = vec![];
+        for &t in toks.iter().filter(|&&t| t >= IMG && t != TID) {
+            let k = (t - IMG) >> 12;
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        let miss: Vec<u32> = keys.iter().copied().filter(|k| !self.ib.contains_key(k)).collect();
+        if miss.is_empty() {
+            return;
+        }
+        self.idle();
+        let rows = |k: &u32| self.pend.get(k).unwrap_or_else(|| panic!("image {k:x}: no rows")).len() / N;
+        let fresh = self.ni + miss.iter().map(rows).sum::<usize>() > IMR;
+        if fresh {
+            (self.ni, self.ib) = (0, HashMap::new());
+        }
+        for k in if fresh { keys } else { miss } {
+            let (e, a) = (&self.pend[&k], self.ni);
+            assert!(a + e.len() / N <= IMR, "the images of one pass are more than the store");
+            slice::<f32>(&self.im)[a * N..][..e.len()].copy_from_slice(e);
+            self.ib.insert(k, a);
+            self.ni = a + e.len() / N;
+        }
     }
 
     // keep the drafter's features of every token from now on
@@ -416,6 +471,11 @@ impl Model {
         let mut w = Vec::with_capacity(self.swa(self.pos).count() * 2048);
         self.swa(self.pos).for_each(|r| w.extend_from_slice(&kv[r]));
         self.ck = Some((self.pos, slice::<f32>(&self.cs).to_vec(), w));
+    }
+
+    // where truncate() can go back to beyond the rings' few steps
+    pub fn mark(&self) -> Option<usize> {
+        self.ck.as_ref().map(|c| c.0)
     }
 
     // forget all but the first n tokens: a few steps back by the rings,
@@ -740,6 +800,7 @@ impl Model {
         let toks = self.prefill(toks, 512);
         let (l, h) = toks.split_last().unwrap();
         for c in h.chunks(4) {
+            self.stage(c);
             let ops = c.iter().enumerate();
             let ops: Vec<_> = ops.flat_map(|(i, &t)| self.sched(t, self.pos + i, false)).collect();
             self.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
@@ -750,6 +811,7 @@ impl Model {
             return self.step(*l);
         }
         // step() reads the token table: an image row goes the long way
+        self.stage(&[*l]);
         let ops = self.sched(*l, self.pos, true);
         self.gpu.run(|e| ops.iter().for_each(|o| o.2(e)));
         drop(ops);

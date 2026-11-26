@@ -424,6 +424,7 @@ impl Dr {
             }
         }));
         // the tail may hold image rows: the general path
+        m.stage(rest);
         rest.iter().fold(0, |_, &t| {
             let r = self.pass(m, &[t])[0];
             self.commit(m, 1, 0);
@@ -880,6 +881,24 @@ pub fn main(a: &[String]) {
         let e: usize = run.iter().enumerate().map(|(k, r)| r * (1 + k.min(b))).sum();
         println!("block {b}: {:.2} tokens per pass", e as f64 / c);
     }
+}
+
+// whether the drafter beside the model has the dspark layout dr reads. the
+// mainline llama.cpp drafter (architecture dflash, unsloth/Inkling-2-Mini-GGUF
+// since 23 November 2026) does not; its dspark-Inkling-2-Mini-Q8_0_Old.gguf does
+pub fn usable(model: &str) -> bool {
+    let d = std::path::Path::new(model).with_file_name(crate::up::DRAFT);
+    if !d.exists() {
+        return true;
+    }
+    let g = gguf::open(d.to_str().unwrap());
+    let ok = g.t.contains_key("dspark_hidden_out.weight");
+    unsafe { libc::munmap(g.map.as_ptr() as *mut _, g.map.len()) };
+    if !ok {
+        eprintln!("gall: {} is not a dspark drafter (mainline layout?); \
+                   serving without drafts", d.display());
+    }
+    ok
 }
 
 // greedy decode with drafts; --block B fixes the drafts per round (0: none)

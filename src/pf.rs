@@ -102,6 +102,7 @@ impl Model {
             let pf = self.pf.take().filter(|p| p.tb >= tb);
             let pf = pf.unwrap_or_else(|| Pf::new(&self.gpu, tb));
             let mut ft = vec![0.; if tap.is_some() { 4 * N * n } else { 0 }];
+            self.stage(&toks[..n]);
             self.t += self.pass(&pf, &toks[..n], &mut ft);
             if let Some(f) = &mut tap {
                 f(self, &ft);

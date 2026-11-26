@@ -22,6 +22,7 @@ pub struct Snaps {
     tag: String,
     at: [u64; 2], // bytes before the full-attention rows, and per token
     ix: Vec<(PathBuf, Toks, bool)>,
+    pub of: usize, // the length of the file the last prime() read, or 0
 }
 type Toks = Vec<u32>;
 
@@ -68,7 +69,7 @@ impl Snaps {
         let at = [c + w, f - w].map(|x| x as u64);
         let dir = PathBuf::from(home.unwrap()).join(".cache/gall");
         fs::create_dir_all(&dir).unwrap();
-        let mut s = Snaps { dir, tag, at, ix: vec![] };
+        let mut s = Snaps { dir, tag, at, ix: vec![], of: 0 };
         let ls = fs::read_dir(&s.dir).unwrap().flatten().map(|e| e.path());
         let ls = ls.filter(|p| p.extension().is_some_and(|x| x == "snap"));
         let ix = ls.filter_map(|p| s.head(&p).map(|h| (p, h.2, h.1[2] > 0)));
@@ -168,11 +169,12 @@ impl Snaps {
         let pre = |i: &usize| c[*i] + 12 >= n(*i) && c[*i] < p.len();
         let best = (0..c.len()).filter(pre).max_by_key(|&i| c[i]);
         let mut got = 0;
+        self.of = 0;
         if let Some(i) = best.filter(|&i| c[i] > k) {
             let t = std::time::Instant::now();
             if self.read(m, i).is_some() && m.truncate(c[i]) {
-                (k, got) = (c[i], c[i]);
-                eprintln!("gall: snap {k} read in {:.2} s", t.elapsed().as_secs_f64());
+                (k, got, self.of) = (c[i], c[i], n(i));
+                eprintln!("gall: snap {k} of {} read in {:.2} s", n(i), t.elapsed().as_secs_f64());
             } else {
                 // a short or foreign file: start again
                 m.reset();
